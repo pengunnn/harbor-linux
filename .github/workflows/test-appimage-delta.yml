@@ -1,0 +1,116 @@
+name: Test AppImage delta download
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    if: github.repository == 'pengunnn/harbor-linux'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Prepare verified delta tool
+        run: |
+          set -euo pipefail
+          mkdir tools seed delta reference
+
+          curl --fail --location --retry 3 \
+            --proto '=https' --proto-redir '=https' \
+            --output tools/zsync2.AppImage \
+            https://github.com/AppImageCommunity/zsync2/releases/download/2.0.0-alpha-1-20250926/zsync2-93-fc62ae7-x86_64.AppImage
+
+          printf '%s  %s\n' \
+            d2001049bf7d22fa85fff2c6096b0c7b7ec398e0e67cdb20cc59c6c51435a361 \
+            tools/zsync2.AppImage |
+            sha256sum --check -
+
+          chmod u+x tools/zsync2.AppImage
+          (
+            cd tools
+            ./zsync2.AppImage --appimage-extract >/dev/null
+          )
+
+      - name: Download A2 and locate B update metadata
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          gh release download linux-updater-test-a2 \
+            --repo "${REPOSITORY}" \
+            --pattern '*.AppImage' \
+            --dir seed
+
+          shopt -s nullglob
+          seed_files=(seed/*.AppImage)
+          if [ "${#seed_files[@]}" -ne 1 ]; then
+            echo "Expected exactly one A2 AppImage." >&2
+            exit 1
+          fi
+          mv -- "${seed_files[0]}" seed/A2.AppImage
+
+          zsync_url="$(gh api \
+            "repos/${REPOSITORY}/releases/tags/linux-updater-test-b" \
+            --jq '
+              [.assets[] | select(.name | endswith(".AppImage.zsync"))]
+              | if length == 1 then .[0].browser_download_url
+                else error("Expected exactly one B zsync asset.")
+                end
+            ')"
+
+          echo "zsync_url=${zsync_url}" >> "${GITHUB_OUTPUT}"
+
+      - name: Reconstruct B using A2
+        working-directory: delta
+        env:
+          ZSYNC_URL: ${{ steps.target.outputs.zsync_url }}
+        run: |
+          set -euo pipefail
+
+          ../tools/squashfs-root/AppRun --force-update \
+            -i ../seed/A2.AppImage \
+            -o B.AppImage \
+            "${ZSYNC_URL}" 2>&1 | tee zsync.log
+
+      - name: Compare reconstructed B with published B
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          gh release download linux-updater-test-b \
+            --repo "${REPOSITORY}" \
+            --pattern '*.AppImage' \
+            --dir reference
+
+          shopt -s nullglob
+          reference_files=(reference/*.AppImage)
+          if [ "${#reference_files[@]}" -ne 1 ]; then
+            echo "Expected exactly one reference B AppImage." >&2
+            exit 1
+          fi
+
+          cmp -- delta/B.AppImage "${reference_files[0]}"
+          full_bytes="$(stat -c '%s' "${reference_files[0]}")"
+
+          {
+            echo "## AppImage delta test"
+            echo
+            echo "Reconstructed B matches published B byte-for-byte."
+            echo
+            echo "Full AppImage size: ${full_bytes} bytes."
+            echo
+            echo "zsync2 statistics: reused local bytes and fetched payload bytes."
+            echo
+            grep -E 'used [0-9]+ local, fetched [0-9]+' delta/zsync.log
+          } >> "${GITHUB_STEP_SUMMARY}"
