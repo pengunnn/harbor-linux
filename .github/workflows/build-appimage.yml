@@ -7,6 +7,11 @@ on:
         description: Immutable Harbor commit to build.
         required: true
         type: string
+      source_repository:
+        description: Harbor source repository to build.
+        required: false
+        default: Harborofficial/Harbor
+        type: string
       tag:
         description: Release tag that will receive the generated assets.
         required: true
@@ -24,11 +29,23 @@ on:
         required: false
         default: false
         type: boolean
+    secrets:
+      TAURI_SIGNING_PRIVATE_KEY:
+        description: Private key used to sign AppImage updates.
+        required: true
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD:
+        description: Password protecting the updater private key.
+        required: true
   workflow_dispatch:
     inputs:
       source_ref:
         description: Harbor commit or ref to build.
         required: true
+        type: string
+      source_repository:
+        description: Harbor source repository to build.
+        required: false
+        default: Harborofficial/Harbor
         type: string
       tag:
         description: Release tag that will receive the generated assets.
@@ -85,7 +102,7 @@ jobs:
       - name: Checkout Harbor source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: Harborofficial/Harbor
+          repository: ${{ inputs.source_repository }}
           ref: ${{ inputs.source_ref }}
           path: harbor
           fetch-depth: 1
@@ -155,6 +172,8 @@ jobs:
         working-directory: harbor
         env:
           CHANNEL: ${{ inputs.channel }}
+          LINUX_UPDATER_PUBLIC_KEY: ${{ vars.LINUX_UPDATER_PUBLIC_KEY }}
+          UPDATE_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           node <<'EOF'
@@ -164,22 +183,55 @@ jobs:
           if (config.bundle?.linux?.appimage?.bundleMediaFramework !== true) {
             throw new Error('The selected Harbor source does not enable AppImage media-framework bundling.');
           }
-          config.bundle.createUpdaterArtifacts = false;
+          const updaterPublicKey =
+            process.env.LINUX_UPDATER_PUBLIC_KEY?.trim();
+
+          if (!updaterPublicKey) {
+            throw new Error('Missing LINUX_UPDATER_PUBLIC_KEY repository variable.');
+          }
+
+          config.bundle.createUpdaterArtifacts = true;
+          config.plugins ??= {};
+          config.plugins.updater ??= {};
+          config.plugins.updater.pubkey = updaterPublicKey;
+          const channel = process.env.CHANNEL;
+          const repository = process.env.UPDATE_REPOSITORY;
+
+          if (!['stable', 'beta'].includes(channel)) {
+            throw new Error(`Unsupported update channel: ${channel}`);
+          }
+
+          if (!repository || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) {
+            throw new Error('Invalid UPDATE_REPOSITORY.');
+          }
+
+          config.plugins.updater.endpoints = [
+            `https://github.com/${repository}/releases/download/updater-test-${channel}/latest.json`,
+          ];
+
           fs.writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
           EOF
-          if [ "${CHANNEL}" = beta ]; then
-            release=latest-pre
-          else
-            release=latest
-          fi
-          echo "upinfo=gh-releases-zsync|Thunderhawkk|harbor-linux|${release}|Harbor_*_amd64.AppImage.zsync" >> "${GITHUB_OUTPUT}"
+          release="updater-test-${CHANNEL}"
+          update_owner="${UPDATE_REPOSITORY%%/*}"
+          update_repo="${UPDATE_REPOSITORY#*/}"
+          echo "upinfo=gh-releases-zsync|${update_owner}|${update_repo}|${release}|Harbor_*_amd64.AppImage.zsync" >> "${GITHUB_OUTPUT}"
 
       - name: Build AppImage
         working-directory: harbor
         env:
           TAURI_BUNDLER_NEW_APPIMAGE_FORMAT: "true"
           UPINFO: ${{ steps.appimage.outputs.upinfo }}
-        run: timeout --signal=TERM 90m cargo tauri build --target x86_64-unknown-linux-gnu --bundles appimage
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          VITE_HARBOR_LINUX_UPDATE_CHANNEL: ${{ inputs.channel }}
+          VITE_HARBOR_LINUX_UPDATE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY}" ]; then
+            echo "Missing TAURI_SIGNING_PRIVATE_KEY secret." >&2
+            exit 1
+          fi
+          timeout --signal=TERM 90m cargo tauri build --target x86_64-unknown-linux-gnu --bundles appimage
 
       - name: Collect AppImage artifacts
         env:
@@ -189,17 +241,80 @@ jobs:
           appimage="$(find harbor/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
           test -n "${appimage}"
           zsync="${appimage}.zsync"
+          signature="${appimage}.sig"
           test -f "${zsync}"
+          test -s "${signature}" || {
+            echo "Expected a nonempty AppImage updater signature: ${signature}" >&2
+            exit 1
+          }
+
           mkdir dist
-          cp "${appimage}" "${zsync}" dist/
-          sha256sum "${appimage}" "${zsync}" > dist/SHA256SUMS-appimage.txt
+          cp "${appimage}" "${zsync}" "${signature}" dist/
+          (
+            cd dist
+            sha256sum ./*.AppImage ./*.AppImage.zsync ./*.AppImage.sig \
+              > SHA256SUMS-appimage.txt
+          )
           jq -n \
             --arg source_ref "${{ steps.package.outputs.source_ref }}" \
             --arg version "${VERSION}" \
             --arg appimage "$(basename "${appimage}")" \
             --arg zsync "$(basename "${zsync}")" \
-            '{source_ref: $source_ref, version: $version, artifacts: [$appimage, $zsync]}' \
+            --arg signature "$(basename "${signature}")" \
+            '{source_ref: $source_ref, version: $version, artifacts: [$appimage, $zsync, $signature]}' \
             > dist/build-manifest.json
+
+      - name: Generate AppImage update manifest
+        env:
+          VERSION: ${{ steps.package.outputs.version }}
+          TAG: ${{ inputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+
+          actual_version="$(jq -er '.version' harbor/src-tauri/tauri.conf.json)"
+          if [ "${VERSION}" != "${actual_version}" ]; then
+            echo "Requested version ${VERSION} differs from app version ${actual_version}." >&2
+            exit 1
+          fi
+
+          test -n "${TAG}"
+
+          appimage="$(jq -er '.artifacts[0]' dist/build-manifest.json)"
+          signature="dist/${appimage}.sig"
+
+          test -s "dist/${appimage}"
+          test -s "${signature}"
+
+          encoded_tag="$(jq -rn --arg value "${TAG}" '$value | @uri')"
+          encoded_asset="$(jq -rn --arg value "${appimage}" '$value | @uri')"
+          download_url="https://github.com/${REPOSITORY}/releases/download/${encoded_tag}/${encoded_asset}"
+          published_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          jq -n \
+            --arg version "${actual_version}" \
+            --arg notes "Harbor Linux ${CHANNEL} updater test build." \
+            --arg pub_date "${published_at}" \
+            --arg url "${download_url}" \
+            --rawfile signature "${signature}" \
+            '{
+              version: $version,
+              notes: $notes,
+              pub_date: $pub_date,
+              platforms: {
+                "linux-x86_64": {
+                  url: $url,
+                  signature: ($signature | gsub("\\s+$"; ""))
+                }
+              }
+            }' > dist/latest.json
+
+          jq -e '
+            (.version | type == "string" and length > 0) and
+            (.platforms["linux-x86_64"].url | startswith("https://")) and
+            (.platforms["linux-x86_64"].signature | length > 0)
+          ' dist/latest.json >/dev/null
 
       - name: Upload AppImage artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -235,17 +350,108 @@ jobs:
           set -euo pipefail
           checksums="SHA256SUMS-${VERSION}.txt"
           gh release view "${TAG}" --repo "${REPOSITORY}" >/dev/null
-          gh release download "${TAG}" --repo "${REPOSITORY}" --pattern "${checksums}" --dir dist
+          release_info="$(gh release view "${TAG}" \
+            --repo "${REPOSITORY}" \
+            --json assets)"
+
+          if jq -e --arg name "${checksums}" \
+            'any(.assets[]; .name == $name)' \
+            <<< "${release_info}" >/dev/null; then
+            gh release download "${TAG}" \
+              --repo "${REPOSITORY}" \
+              --pattern "${checksums}" \
+              --dir dist
+          elif jq -e '.assets | length == 0' \
+            <<< "${release_info}" >/dev/null; then
+            : > "dist/${checksums}"
+          else
+            echo "Release ${TAG} has assets but no ${checksums}; refusing to replace incomplete checksums." >&2
+            exit 1
+          fi
 
           tmpfile="$(mktemp)"
           trap 'rm -f "${tmpfile}"' EXIT
-          grep -v -E '  Harbor_.*_amd64\.AppImage(\.zsync)?$' "dist/${checksums}" > "${tmpfile}" || true
-          sha256sum dist/*.AppImage dist/*.AppImage.zsync >> "${tmpfile}"
+          awk '!/  (dist\/|\.\/)?Harbor_.*_amd64\.AppImage(\.zsync|\.sig)?$/' \
+            "dist/${checksums}" > "${tmpfile}"
+
+          (
+            cd dist
+            sha256sum -- *.AppImage *.AppImage.zsync *.AppImage.sig
+          ) >> "${tmpfile}"
+
           sort -k 2,2 "${tmpfile}" > "dist/${checksums}"
 
           gh release upload "${TAG}" \
             dist/*.AppImage \
             dist/*.AppImage.zsync \
+            dist/*.AppImage.sig \
             "dist/${checksums}" \
+            --repo "${REPOSITORY}" \
+            --clobber
+
+      - name: Publish test update feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+
+          case "${CHANNEL}" in
+            stable|beta) ;;
+            *)
+              echo "Unsupported update channel: ${CHANNEL}" >&2
+              exit 1
+              ;;
+          esac
+
+          test -s dist/latest.json
+          feed_tag="updater-test-${CHANNEL}"
+
+          gh release view "${feed_tag}" \
+            --repo "${REPOSITORY}" >/dev/null
+
+          appimage="$(jq -er '.artifacts[0]' dist/build-manifest.json)"
+          case "${appimage}" in
+            Harbor_*_amd64.AppImage) ;;
+            *)
+              echo "Unexpected AppImage filename: ${appimage}" >&2
+              exit 1
+              ;;
+          esac
+
+          test -s "dist/${appimage}"
+          test -s "dist/${appimage}.sig"
+          test -s "dist/${appimage}.zsync"
+
+          gh release upload "${feed_tag}" \
+            "dist/${appimage}" \
+            "dist/${appimage}.sig" \
+            --repo "${REPOSITORY}" \
+            --clobber
+
+          gh release upload "${feed_tag}" \
+            "dist/${appimage}.zsync" \
+            --repo "${REPOSITORY}" \
+            --clobber
+
+          stale_zsync="$(gh release view "${feed_tag}" \
+            --repo "${REPOSITORY}" \
+            --json assets |
+            jq -r --arg current "${appimage}.zsync" '
+              .assets[].name
+              | select(test("^Harbor_.*_amd64\\.AppImage\\.zsync$"))
+              | select(. != $current)
+            ')"
+
+          while IFS= read -r asset; do
+            [ -n "${asset}" ] || continue
+            gh release delete-asset "${feed_tag}" "${asset}" \
+              --repo "${REPOSITORY}" \
+              --yes
+          done <<< "${stale_zsync}"
+
+          gh release upload "${feed_tag}" \
+            dist/latest.json \
             --repo "${REPOSITORY}" \
             --clobber
