@@ -482,6 +482,9 @@ jobs:
       tag: ${{ inputs.tag }}
       version: ${{ inputs.version }}
       channel: ${{ inputs.channel }}
+    secrets:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
   publish-appimage:
     name: Publish experimental AppImage
@@ -509,10 +512,106 @@ jobs:
         run: |
           set -euo pipefail
           checksums="SHA256SUMS-${VERSION}.txt"
-          gh release download "${TAG}" --repo "${REPOSITORY}" --pattern "${checksums}" --dir dist
+          release_info="$(gh release view "${TAG}" \
+            --repo "${REPOSITORY}" \
+            --json assets)"
+
+          if jq -e --arg name "${checksums}" \
+            'any(.assets[]; .name == $name)' \
+            <<< "${release_info}" >/dev/null; then
+            gh release download "${TAG}" \
+              --repo "${REPOSITORY}" \
+              --pattern "${checksums}" \
+              --dir dist
+          elif jq -e '.assets | length == 0' \
+            <<< "${release_info}" >/dev/null; then
+            : > "dist/${checksums}"
+          else
+            echo "Release ${TAG} has assets but no ${checksums}; refusing to replace incomplete checksums." >&2
+            exit 1
+          fi
           tmpfile="$(mktemp)"
           trap 'rm -f "${tmpfile}"' EXIT
-          grep -v -E '  Harbor_.*_amd64\.AppImage(\.zsync)?$' "dist/${checksums}" > "${tmpfile}" || true
-          sha256sum dist/*.AppImage dist/*.AppImage.zsync >> "${tmpfile}"
+          awk '!/  (dist\/|\.\/)?Harbor_.*_amd64\.AppImage(\.zsync|\.sig)?$/' \
+            "dist/${checksums}" > "${tmpfile}"
+
+          (
+            cd dist
+            sha256sum -- *.AppImage *.AppImage.zsync *.AppImage.sig
+          ) >> "${tmpfile}"
+
           sort -k 2,2 "${tmpfile}" > "dist/${checksums}"
-          gh release upload "${TAG}" dist/*.AppImage dist/*.AppImage.zsync "dist/${checksums}" --repo "${REPOSITORY}" --clobber
+          gh release upload "${TAG}" \
+            dist/*.AppImage \
+            dist/*.AppImage.zsync \
+            dist/*.AppImage.sig \
+            "dist/${checksums}" \
+            --repo "${REPOSITORY}" \
+            --clobber
+
+      - name: Publish test update feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+
+          case "${CHANNEL}" in
+            stable|beta) ;;
+            *)
+              echo "Unsupported update channel: ${CHANNEL}" >&2
+              exit 1
+              ;;
+          esac
+
+          test -s dist/latest.json
+          feed_tag="updater-test-${CHANNEL}"
+
+          gh release view "${feed_tag}" \
+            --repo "${REPOSITORY}" >/dev/null
+
+          appimage="$(jq -er '.artifacts[0]' dist/build-manifest.json)"
+          case "${appimage}" in
+            Harbor_*_amd64.AppImage) ;;
+            *)
+              echo "Unexpected AppImage filename: ${appimage}" >&2
+              exit 1
+              ;;
+          esac
+
+          test -s "dist/${appimage}"
+          test -s "dist/${appimage}.sig"
+          test -s "dist/${appimage}.zsync"
+
+          gh release upload "${feed_tag}" \
+            "dist/${appimage}" \
+            "dist/${appimage}.sig" \
+            --repo "${REPOSITORY}" \
+            --clobber
+
+          gh release upload "${feed_tag}" \
+            "dist/${appimage}.zsync" \
+            --repo "${REPOSITORY}" \
+            --clobber
+
+          stale_zsync="$(gh release view "${feed_tag}" \
+            --repo "${REPOSITORY}" \
+            --json assets |
+            jq -r --arg current "${appimage}.zsync" '
+              .assets[].name
+              | select(test("^Harbor_.*_amd64\\.AppImage\\.zsync$"))
+              | select(. != $current)
+            ')"
+
+          while IFS= read -r asset; do
+            [ -n "${asset}" ] || continue
+            gh release delete-asset "${feed_tag}" "${asset}" \
+              --repo "${REPOSITORY}" \
+              --yes
+          done <<< "${stale_zsync}"
+
+          gh release upload "${feed_tag}" \
+            dist/latest.json \
+            --repo "${REPOSITORY}" \
+            --clobber
