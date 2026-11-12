@@ -287,7 +287,13 @@ jobs:
             echo "Missing TAURI_SIGNING_PRIVATE_KEY secret." >&2
             exit 1
           fi
-          timeout --signal=TERM 90m cargo tauri build --target x86_64-unknown-linux-gnu --bundles appimage
+          test -x /bin/sh
+          /bin/sh -c 'printf "Packaging shell starts successfully\n"'
+          df -h . "${RUNNER_TEMP}"
+          timeout --signal=TERM 90m cargo tauri build \
+            --verbose --verbose \
+            --target x86_64-unknown-linux-gnu \
+            --bundles appimage
 
       - name: Collect AppImage artifacts
         env:
