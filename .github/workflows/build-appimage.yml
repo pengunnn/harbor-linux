@@ -157,6 +157,52 @@ jobs:
             ln -sf /usr/bin/yt-dlp src-tauri/binaries/yt-dlp-x86_64-unknown-linux-gnu
           fi
 
+      - name: Prepare verified AppImage delta helper
+        working-directory: harbor
+        run: |
+          set -euo pipefail
+
+          helper_tmp="$(mktemp -d)"
+          trap 'rm -rf -- "${helper_tmp}"' EXIT
+
+          curl --fail --location --retry 3 \
+            --proto '=https' --proto-redir '=https' \
+            --output "${helper_tmp}/zsync2.AppImage" \
+            https://github.com/AppImageCommunity/zsync2/releases/download/2.0.0-alpha-1-20250926/zsync2-93-fc62ae7-x86_64.AppImage
+
+          printf '%s  %s\n' \
+            d2001049bf7d22fa85fff2c6096b0c7b7ec398e0e67cdb20cc59c6c51435a361 \
+            "${helper_tmp}/zsync2.AppImage" |
+            sha256sum --check -
+
+          chmod u+x "${helper_tmp}/zsync2.AppImage"
+          (
+            cd "${helper_tmp}"
+            ./zsync2.AppImage --appimage-extract >/dev/null
+          )
+
+          test -x "${helper_tmp}/squashfs-root/AppRun"
+          "${helper_tmp}/squashfs-root/AppRun" --help
+
+          helper_dest="src-tauri/resources/linux-updater/zsync2"
+          if [ -e "${helper_dest}" ]; then
+            echo "Delta helper destination already exists: ${helper_dest}" >&2
+            exit 1
+          fi
+
+          mkdir -p "$(dirname "${helper_dest}")"
+          cp -a "${helper_tmp}/squashfs-root" "${helper_dest}"
+          test -x "${helper_dest}/AppRun"
+
+          env \
+            -u APPIMAGE \
+            -u APPDIR \
+            -u ARGV0 \
+            -u OWD \
+            -u LD_LIBRARY_PATH \
+            -u LD_PRELOAD \
+            "${helper_dest}/AppRun" --help
+
       - name: Install experimental Tauri bundler
         run: |
           set -euo pipefail
@@ -191,6 +237,16 @@ jobs:
           }
 
           config.bundle.createUpdaterArtifacts = true;
+          config.bundle.resources ??= {};
+          if (
+            typeof config.bundle.resources !== 'object' ||
+            Array.isArray(config.bundle.resources)
+          ) {
+            throw new Error('Expected bundle.resources to be a resource map.');
+          }
+
+          config.bundle.resources['resources/linux-updater/zsync2/'] =
+            'linux-updater/zsync2/';
           config.plugins ??= {};
           config.plugins.updater ??= {};
           config.plugins.updater.pubkey = updaterPublicKey;
@@ -263,6 +319,54 @@ jobs:
             --arg signature "$(basename "${signature}")" \
             '{source_ref: $source_ref, version: $version, artifacts: [$appimage, $zsync, $signature]}' \
             > dist/build-manifest.json
+
+      - name: Verify delta helper inside built AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob
+          appimages=(dist/*.AppImage)
+          if [ "${#appimages[@]}" -ne 1 ]; then
+            echo "Expected exactly one collected AppImage." >&2
+            exit 1
+          fi
+
+          appimage="$(realpath "${appimages[0]}")"
+          test -x "${appimage}"
+
+          verify_tmp="$(mktemp -d)"
+          trap 'rm -rf -- "${verify_tmp}"' EXIT
+
+          (
+            cd "${verify_tmp}"
+            timeout 120s "${appimage}" --appimage-extract >/dev/null
+          )
+
+          mapfile -d '' helpers < <(
+            find "${verify_tmp}/squashfs-root" \
+              -path '*/linux-updater/zsync2/AppRun' -print0
+          )
+
+          if [ "${#helpers[@]}" -ne 1 ]; then
+            echo "Expected exactly one bundled delta helper." >&2
+            exit 1
+          fi
+
+          test -f "${helpers[0]}"
+          test -x "${helpers[0]}"
+
+          (
+            cd "${verify_tmp}"
+            timeout 30s env \
+              -u APPIMAGE \
+              -u APPDIR \
+              -u ARGV0 \
+              -u OWD \
+              -u LD_LIBRARY_PATH \
+              -u LD_PRELOAD \
+              "${helpers[0]}" --help
+          )
 
       - name: Generate AppImage update manifest
         env:
