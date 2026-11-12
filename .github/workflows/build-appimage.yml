@@ -275,6 +275,7 @@ jobs:
       - name: Build AppImage
         working-directory: harbor
         env:
+          I_WANT_FAT_APPIMAGE: "1"
           TAURI_BUNDLER_NEW_APPIMAGE_FORMAT: "true"
           UPINFO: ${{ steps.appimage.outputs.upinfo }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
